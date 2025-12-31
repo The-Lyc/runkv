@@ -1,54 +1,54 @@
-# KV Cache 按 Layer 存储示例
+# KV Cache Storage by Layer Example
 
-本文档通过实际代码展示 llama.cpp 中 KV cache 如何按 layer 存储，以及 `cpy_k` 和 `get_k` 的使用方式。
+This document demonstrates through actual code how KV cache is stored by layer in llama.cpp, and how `cpy_k` and `get_k` are used.
 
-## 1. 数据结构回顾
+## 1. Data Structure Review
 
-### 每层独立的 K/V tensor
+### Independent K/V Tensors Per Layer
 ```cpp
-// 位置: src/llama-kv-cache.h:206-216
+// Location: src/llama-kv-cache.h:206-216
 struct kv_layer {
-    uint32_t il;  // 模型中的 layer 索引
+    uint32_t il;  // Layer index in model
     
     ggml_tensor * k;  // K cache: [n_embd_k_gqa, kv_size, n_stream]
     ggml_tensor * v;  // V cache: [n_embd_v_gqa, kv_size, n_stream]
     
-    std::vector<ggml_tensor *> k_stream;  // 每个 stream 的视图
+    std::vector<ggml_tensor *> k_stream;  // View for each stream
     std::vector<ggml_tensor *> v_stream;
 };
 
-std::vector<kv_layer> layers;  // 关键：每层一个独立的 tensor
+std::vector<kv_layer> layers;  // Key: One independent tensor per layer
 ```
 
-**关键点：**
-- `layers[0].k` 存储第 0 层的所有 K 值
-- `layers[1].k` 存储第 1 层的所有 K 值
-- ...依此类推，**按 layer 分离存储**
+**Key Points:**
+- `layers[0].k` stores all K values for layer 0
+- `layers[1].k` stores all K values for layer 1
+- ...and so on, **separated storage by layer**
 
-## 2. get_k() - 读取某层的 K cache
+## 2. get_k() - Read K Cache for a Specific Layer
 
-### 函数签名与实现
+### Function Signature and Implementation
 ```cpp
-// 位置: src/llama-kv-cache.cpp:1008-1027
+// Location: src/llama-kv-cache.cpp:1008-1027
 ggml_tensor * llama_kv_cache::get_k(
     ggml_context * ctx,
-    int32_t il,              // 输入：layer 索引
-    uint32_t n_kv,           // 要读取的 cell 数量
-    const slot_info & sinfo  // cell 映射信息
+    int32_t il,              // Input: layer index
+    uint32_t n_kv,           // Number of cells to read
+    const slot_info & sinfo  // Cell mapping information
 ) const {
-    // 步骤 1: 通过 layer 索引找到对应的 kv_layer
+    // Step 1: Find corresponding kv_layer through layer index
     const int32_t ikv = map_layer_ids.at(il);
     
-    // 步骤 2: 获取该层的 K tensor
-    auto * k = layers[ikv].k;  // 这是第 il 层的 K cache
+    // Step 2: Get K tensor for this layer
+    auto * k = layers[ikv].k;  // This is the K cache for layer il
     
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
     
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
     
-    // 步骤 3: 创建一个 4D 视图用于 attention 计算
-    // 返回形状: [n_embd_head_k, n_head_kv, n_kv, n_stream]
+    // Step 3: Create a 4D view for attention computation
+    // Return shape: [n_embd_head_k, n_head_kv, n_kv, n_stream]
     return ggml_view_4d(ctx, k,
         hparams.n_embd_head_k, hparams.n_head_kv(il), n_kv, ns,
         ggml_row_size(k->type, hparams.n_embd_head_k),      // stride for heads
@@ -58,41 +58,41 @@ ggml_tensor * llama_kv_cache::get_k(
 }
 ```
 
-**体现按 layer 存储的关键：**
+**Key reflection of storage by layer:**
 ```cpp
-auto * k = layers[ikv].k;  // 直接索引到特定层的 tensor
+auto * k = layers[ikv].k;  // Directly index to specific layer's tensor
 ```
 
-### 在实际 attention 计算中的使用
+### Usage in Actual Attention Computation
 ```cpp
-// 位置: src/llama-graph.cpp:1676
-// 在构建第 il 层的 attention 图时
+// Location: src/llama-graph.cpp:1676
+// When building attention graph for layer il
 
-ggml_tensor * k = mctx_cur->get_k(ctx0, il);  // 获取第 il 层的 K
-ggml_tensor * v = mctx_cur->get_v(ctx0, il);  // 获取第 il 层的 V
+ggml_tensor * k = mctx_cur->get_k(ctx0, il);  // Get K for layer il
+ggml_tensor * v = mctx_cur->get_v(ctx0, il);  // Get V for layer il
 
-// k 现在包含第 il 层的所有 K 值，形状: [head_dim, n_heads, n_kv, n_stream]
-// 用于计算 QK^T
+// k now contains all K values for layer il, shape: [head_dim, n_heads, n_kv, n_stream]
+// Used to compute QK^T
 ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);  // Q @ K^T
 ```
 
-## 3. cpy_k() - 写入某层的 K cache
+## 3. cpy_k() - Write to K Cache for a Specific Layer
 
-### 函数签名与实现
+### Function Signature and Implementation
 ```cpp
-// 位置: src/llama-kv-cache.cpp:1060-1093
+// Location: src/llama-kv-cache.cpp:1060-1093
 ggml_tensor * llama_kv_cache::cpy_k(
     ggml_context * ctx,
-    ggml_tensor * k_cur,     // 输入：当前计算的 K [n_embd_head_k, n_head_k, n_tokens]
-    ggml_tensor * k_idxs,    // 输入：cell 索引 [n_tokens]
-    int32_t il,              // 输入：layer 索引
+    ggml_tensor * k_cur,     // Input: current computed K [n_embd_head_k, n_head_k, n_tokens]
+    ggml_tensor * k_idxs,    // Input: cell indices [n_tokens]
+    int32_t il,              // Input: layer index
     const slot_info & sinfo
 ) const {
-    // 步骤 1: 通过 layer 索引找到对应的 kv_layer
+    // Step 1: Find corresponding kv_layer through layer index
     const int32_t ikv = map_layer_ids.at(il);
     
-    // 步骤 2: 获取该层的 K tensor（目标位置）
-    ggml_tensor * k = layers[ikv].k;  // 这是第 il 层的 K cache
+    // Step 2: Get K tensor for this layer (destination)
+    ggml_tensor * k = layers[ikv].k;  // This is the K cache for layer il
     
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
@@ -100,140 +100,140 @@ ggml_tensor * llama_kv_cache::cpy_k(
     
     const int64_t n_embd_gqa = n_embd_head*n_head;
     
-    // 步骤 3: 将 k_cur 重塑为 2D: [n_embd_gqa, n_tokens]
+    // Step 3: Reshape k_cur to 2D: [n_embd_gqa, n_tokens]
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
     
     const int64_t n_stream = k->ne[2];
     
     if (n_stream > 1) {
         const int64_t kv_size = get_size();
-        // 合并所有 streams 成一个大的 2D tensor
+        // Merge all streams into one large 2D tensor
         k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
     }
     
-    // 步骤 4: 使用 set_rows 按索引写入
+    // Step 4: Use set_rows to write by index
     // k[k_idxs[i]] = k_cur[i] for each token i
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 ```
 
-**体现按 layer 存储的关键：**
+**Key reflection of storage by layer:**
 ```cpp
-ggml_tensor * k = layers[ikv].k;  // 写入特定层的 tensor
+ggml_tensor * k = layers[ikv].k;  // Write to specific layer's tensor
 ```
 
-### 在实际计算中的使用
+### Usage in Actual Computation
 ```cpp
-// 位置: src/llama-graph.cpp:1669
-// 在第 il 层前向传播时
+// Location: src/llama-graph.cpp:1669
+// During forward propagation of layer il
 
-// 计算当前 batch 的 K 值
+// Compute K values for current batch
 ggml_tensor * k_cur = ggml_mul_mat(ctx0, wk, cur);  // [head_dim, n_heads, n_tokens]
 
-// 准备 cell 索引
-const auto & k_idxs = inp->get_k_idxs();  // [n_tokens]，每个值是 cell 索引
+// Prepare cell indices
+const auto & k_idxs = inp->get_k_idxs();  // [n_tokens], each value is a cell index
 
-// 将 k_cur 写入第 il 层的 K cache
+// Write k_cur to K cache for layer il
 ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
 ```
 
-## 4. 完整流程示例
+## 4. Complete Flow Example
 
-假设处理一个 2 层模型，batch 包含 3 个 tokens：
+Assume processing a 2-layer model, batch contains 3 tokens:
 
-### 初始化
+### Initialization
 ```cpp
-// 构造时创建每层的 tensor
-layers[0].k = ggml_new_tensor_3d(ctx, type_k, 4096, 512, 1);  // 第 0 层
-layers[1].k = ggml_new_tensor_3d(ctx, type_k, 4096, 512, 1);  // 第 1 层
+// Create tensors for each layer during construction
+layers[0].k = ggml_new_tensor_3d(ctx, type_k, 4096, 512, 1);  // Layer 0
+layers[1].k = ggml_new_tensor_3d(ctx, type_k, 4096, 512, 1);  // Layer 1
 ```
 
-### Layer 0 的处理
+### Layer 0 Processing
 ```cpp
-// 1. 计算 Layer 0 的 K 值
+// 1. Compute K values for Layer 0
 ggml_tensor * k_cur_l0 = compute_k_layer_0(input);  // [128, 32, 3]
                                                      // [head_dim, n_heads, n_tokens]
 
-// 2. 分配 cells (假设分配到 cell 5, 6, 7)
+// 2. Allocate cells (assume allocated to cells 5, 6, 7)
 k_idxs->data = {5, 6, 7};
 
-// 3. 写入 Layer 0 的 K cache
+// 3. Write to Layer 0's K cache
 cpy_k(ctx, k_cur_l0, k_idxs, il=0);
-// 执行: layers[0].k[..., 5] = k_cur_l0[..., 0]
-//       layers[0].k[..., 6] = k_cur_l0[..., 1]
-//       layers[0].k[..., 7] = k_cur_l0[..., 2]
+// Executes: layers[0].k[..., 5] = k_cur_l0[..., 0]
+//           layers[0].k[..., 6] = k_cur_l0[..., 1]
+//           layers[0].k[..., 7] = k_cur_l0[..., 2]
 
-// 4. 读取 Layer 0 的 K cache (假设已有 10 个 tokens)
+// 4. Read Layer 0's K cache (assume already has 10 tokens)
 ggml_tensor * k_l0 = get_k(ctx, il=0, n_kv=10);
-// 返回: layers[0].k[..., 0:10]  // 只从 Layer 0 读取
+// Returns: layers[0].k[..., 0:10]  // Read only from Layer 0
 ```
 
-### Layer 1 的处理
+### Layer 1 Processing
 ```cpp
-// 1. 计算 Layer 1 的 K 值
+// 1. Compute K values for Layer 1
 ggml_tensor * k_cur_l1 = compute_k_layer_1(hidden);  // [128, 32, 3]
 
-// 2. 使用相同的 cell 索引 {5, 6, 7}
+// 2. Use same cell indices {5, 6, 7}
 k_idxs->data = {5, 6, 7};
 
-// 3. 写入 Layer 1 的 K cache（注意：不同的 tensor）
+// 3. Write to Layer 1's K cache (note: different tensor)
 cpy_k(ctx, k_cur_l1, k_idxs, il=1);
-// 执行: layers[1].k[..., 5] = k_cur_l1[..., 0]  // 写入 Layer 1 的 tensor
-//       layers[1].k[..., 6] = k_cur_l1[..., 1]
-//       layers[1].k[..., 7] = k_cur_l1[..., 2]
+// Executes: layers[1].k[..., 5] = k_cur_l1[..., 0]  // Write to Layer 1's tensor
+//           layers[1].k[..., 6] = k_cur_l1[..., 1]
+//           layers[1].k[..., 7] = k_cur_l1[..., 2]
 
-// 4. 读取 Layer 1 的 K cache
+// 4. Read Layer 1's K cache
 ggml_tensor * k_l1 = get_k(ctx, il=1, n_kv=10);
-// 返回: layers[1].k[..., 0:10]  // 只从 Layer 1 读取
+// Returns: layers[1].k[..., 0:10]  // Read only from Layer 1
 ```
 
-## 5. 关键总结
+## 5. Key Summary
 
-### Cell 管理（token 维度）
-- **全局共享**：所有 layer 使用相同的 cell 分配
-- `v_cells` 记录哪些 cells 被占用，以及它们的 token positions
-- Cell 索引（如 5, 6, 7）在所有 layer 中含义相同
+### Cell Management (token dimension)
+- **Globally shared**: All layers use same cell allocation
+- `v_cells` records which cells are occupied and their token positions
+- Cell indices (like 5, 6, 7) have same meaning across all layers
 
-### 数据存储（layer 维度）
-- **按 layer 分离**：每层有独立的 `layers[il].k` 和 `layers[il].v` tensor
-- Cell 5 在 Layer 0 和 Layer 1 中存储**不同的数据**：
-  - `layers[0].k[..., 5]` 存储 Layer 0 的某个 token 的 K 值
-  - `layers[1].k[..., 5]` 存储 Layer 1 的**同一个 token** 的 K 值
+### Data Storage (layer dimension)
+- **Separated by layer**: Each layer has independent `layers[il].k` and `layers[il].v` tensors
+- Cell 5 stores **different data** in Layer 0 and Layer 1:
+  - `layers[0].k[..., 5]` stores Layer 0's K value for a token
+  - `layers[1].k[..., 5]` stores Layer 1's K value for the **same token**
 
-### 读写操作
+### Read/Write Operations
 ```
-写入 (cpy_k):
-  token → cell 索引 → 在特定 layer 的 tensor 中写入
+Write (cpy_k):
+  token → cell index → write in specific layer's tensor
   
-读取 (get_k):
-  指定 layer → 返回该 layer tensor 的视图 → 用于该 layer 的 attention
+Read (get_k):
+  specify layer → return view of that layer's tensor → use for that layer's attention
 
-关键：每次 cpy_k/get_k 都通过 il 参数指定 layer，
-      从而操作 layers[il].k 这个**独立的** tensor
+Key: Each cpy_k/get_k specifies layer via il parameter,
+     thus operating on layers[il].k, an **independent** tensor
 ```
 
-## 6. 内存布局可视化
+## 6. Memory Layout Visualization
 
 ```
-KV Cache 内存结构:
+KV Cache Memory Structure:
 
 layers[0].k:  [embedding_dim, kv_size, n_stream]
               ┌─────────────────────────────────┐
-    Cell 0 →  │ Layer 0, Token at pos=0  的 K   │
-    Cell 1 →  │ Layer 0, Token at pos=1  的 K   │
-    Cell 2 →  │ Layer 0, Token at pos=2  的 K   │
+    Cell 0 →  │ Layer 0, K for token at pos=0   │
+    Cell 1 →  │ Layer 0, K for token at pos=1   │
+    Cell 2 →  │ Layer 0, K for token at pos=2   │
               │            ...                  │
               └─────────────────────────────────┘
 
 layers[1].k:  [embedding_dim, kv_size, n_stream]
               ┌─────────────────────────────────┐
-    Cell 0 →  │ Layer 1, Token at pos=0  的 K   │
-    Cell 1 →  │ Layer 1, Token at pos=1  的 K   │
-    Cell 2 →  │ Layer 1, Token at pos=2  的 K   │
+    Cell 0 →  │ Layer 1, K for token at pos=0   │
+    Cell 1 →  │ Layer 1, K for token at pos=1   │
+    Cell 2 →  │ Layer 1, K for token at pos=2   │
               │            ...                  │
               └─────────────────────────────────┘
 
-v_cells:      统一管理所有 layer 的 cell 分配
+v_cells:      Unified management of cell allocation for all layers
               ┌────────┬──────┬────────────┐
     Cell 0 →  │ pos=0  │ used │ seq_id=0   │
     Cell 1 →  │ pos=1  │ used │ seq_id=0   │
@@ -242,8 +242,8 @@ v_cells:      统一管理所有 layer 的 cell 分配
               └────────┴──────┴────────────┘
 ```
 
-**体现的关键设计：**
-1. Cell 管理（`v_cells`）是全局的，跨所有 layer
-2. 数据存储（`layers[il].k/v`）是分层的，每层独立
-3. 通过 `il` 参数选择操作哪一层的 tensor
-4. Cell 索引在所有层中保持一致，但存储的数据不同
+**Key design reflections:**
+1. Cell management (`v_cells`) is global, across all layers
+2. Data storage (`layers[il].k/v`) is layered, each layer independent
+3. Select which layer's tensor to operate on via `il` parameter
+4. Cell indices are consistent across all layers, but stored data differs
